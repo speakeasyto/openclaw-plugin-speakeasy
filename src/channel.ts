@@ -60,6 +60,19 @@ const runtimeStore = createPluginRuntimeStore<PluginRuntime>(
   "Speakeasy runtime is not initialized yet. OpenClaw should call setRuntime() during plugin registration."
 );
 
+type RuntimeConfigCompat = PluginRuntime["config"] & {
+  current?: () => OpenClawConfig;
+  replaceConfigFile?: (params: {
+    nextConfig: OpenClawConfig;
+    afterWrite: { mode: "none"; reason: string };
+  }) => Promise<unknown>;
+};
+
+const AUTH_REFRESH_AFTER_WRITE = {
+  mode: "none" as const,
+  reason: "Speakeasy access token refresh should not restart the gateway"
+};
+
 const webhookTargets = new Map<
   string,
   {
@@ -147,7 +160,7 @@ function applyRefreshedAuthToAccount(account: ResolvedSpeakeasyAccount, auth: Sp
     resolveAgentHandleFromAccessToken(auth.accessToken);
 }
 
-async function persistRefreshedAuth(params: {
+export async function persistRefreshedAuth(params: {
   account: ResolvedSpeakeasyAccount;
   auth: SpeakeasyAuthRefreshResult;
   logger: LoggerLike;
@@ -160,7 +173,10 @@ async function persistRefreshedAuth(params: {
     return;
   }
 
-  const currentCfg = runtime.config.loadConfig();
+  const runtimeConfig = runtime.config as RuntimeConfigCompat;
+  // Always reload from disk before merging auth. runtimeConfig.current() is the
+  // Gateway's applied snapshot and may lag behind unrelated persisted changes.
+  const currentCfg = runtimeConfig.loadConfig();
   const currentAccount = resolveSpeakeasyAccount(
     currentCfg as unknown as Record<string, unknown>,
     params.account.accountId
@@ -182,9 +198,19 @@ async function persistRefreshedAuth(params: {
     return;
   }
 
-  await runtime.config.writeConfigFile(
-    writeSpeakeasyAccount(currentCfg as unknown as Record<string, unknown>, nextAccount) as OpenClawConfig
-  );
+  const nextConfig = writeSpeakeasyAccount(
+    currentCfg as unknown as Record<string, unknown>,
+    nextAccount
+  ) as OpenClawConfig;
+
+  if (runtimeConfig.replaceConfigFile) {
+    await runtimeConfig.replaceConfigFile({
+      nextConfig,
+      afterWrite: AUTH_REFRESH_AFTER_WRITE
+    });
+  } else {
+    await runtimeConfig.writeConfigFile(nextConfig, { afterWrite: AUTH_REFRESH_AFTER_WRITE } as never);
+  }
 
   params.logger.info("persisted refreshed Speakeasy auth", {
     accountId: params.account.accountId,
@@ -217,8 +243,9 @@ function createAccountClient(params: {
       }
 
       try {
+        const runtimeConfig = runtime.config as RuntimeConfigCompat;
         const latest = resolveSpeakeasyAccount(
-          runtime.config.loadConfig() as unknown as Record<string, unknown>,
+          runtimeConfig.loadConfig() as unknown as Record<string, unknown>,
           params.account.accountId
         );
 

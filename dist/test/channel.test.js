@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+const { runtimeState } = vi.hoisted(() => ({
+    runtimeState: { value: undefined }
+}));
 vi.mock("openclaw/plugin-sdk/core", () => ({
     buildChannelOutboundSessionRoute: vi.fn(),
     createChannelPluginBase: vi.fn((plugin) => plugin)
@@ -9,13 +12,19 @@ vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
 }));
 vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
     createPluginRuntimeStore: vi.fn(() => ({
-        setRuntime: () => undefined,
+        setRuntime: (runtime) => {
+            runtimeState.value = runtime;
+        },
+        tryGetRuntime: () => runtimeState.value ?? null,
         getRuntime: () => {
+            if (runtimeState.value) {
+                return runtimeState.value;
+            }
             throw new Error("runtime is not available in the channel gateway lifecycle test");
         }
     }))
 }));
-const { speakeasyChannelPlugin, withSpeakeasyTopicTyping } = await import("../src/channel.js");
+const { persistRefreshedAuth, setSpeakeasyRuntime, speakeasyChannelPlugin, withSpeakeasyTopicTyping } = await import("../src/channel.js");
 class FakeWebSocket {
     url;
     static instances = [];
@@ -103,6 +112,80 @@ describe("channel gateway", () => {
         globalThis.WebSocket = originalWebSocket;
         globalThis.fetch = originalFetch;
         FakeWebSocket.instances = [];
+        runtimeState.value = undefined;
+    });
+    it("preserves newly persisted settings when refreshing auth", async () => {
+        const staleConfig = {
+            ...cfg,
+            messages: { ackReactionScope: "group-mentions" }
+        };
+        const latestConfig = {
+            ...cfg,
+            messages: {
+                ackReactionScope: "group-mentions",
+                visibleReplies: "message_tool"
+            },
+            channels: {
+                speakeasy: {
+                    accounts: {
+                        default: {
+                            ...cfg.channels.speakeasy.accounts.default,
+                            accessToken: "old-access-token",
+                            refreshToken: "old-refresh-token"
+                        }
+                    }
+                }
+            }
+        };
+        const replaceConfigFile = vi.fn(async (_params) => undefined);
+        const loadConfig = vi.fn(() => latestConfig);
+        setSpeakeasyRuntime({
+            config: {
+                current: () => staleConfig,
+                loadConfig,
+                replaceConfigFile,
+                writeConfigFile: vi.fn()
+            }
+        });
+        const account = {
+            ...latestConfig.channels.speakeasy.accounts.default,
+            accountId: "default"
+        };
+        await persistRefreshedAuth({
+            account,
+            auth: {
+                accessToken: "new-access-token",
+                refreshToken: "new-refresh-token",
+                expiresAt: "2026-11-09T04:00:00Z"
+            },
+            logger: {
+                debug: vi.fn(),
+                info: vi.fn(),
+                warn: vi.fn(),
+                error: vi.fn()
+            }
+        });
+        expect(loadConfig).toHaveBeenCalledOnce();
+        expect(replaceConfigFile).toHaveBeenCalledOnce();
+        expect(replaceConfigFile.mock.calls[0]?.[0]).toMatchObject({
+            nextConfig: {
+                messages: {
+                    ackReactionScope: "group-mentions",
+                    visibleReplies: "message_tool"
+                },
+                channels: {
+                    speakeasy: {
+                        accounts: {
+                            default: {
+                                accessToken: "new-access-token",
+                                refreshToken: "new-refresh-token",
+                                expiresAt: "2026-11-09T04:00:00Z"
+                            }
+                        }
+                    }
+                }
+            }
+        });
     });
     it("keeps gateway accounts alive until abort and replaces orphaned transports", async () => {
         expect(startAccount).toBeTypeOf("function");
